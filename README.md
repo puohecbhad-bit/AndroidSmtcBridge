@@ -1,4 +1,5 @@
 # Android → Windows SMTC Bridge
+  or so called MediaBridge.
 
 This project mirrors the active Android media session into Windows System Media
 Transport Controls (SMTC). It synchronizes metadata, album art, playback state,
