@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.util.Log
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.BufferedWriter
@@ -20,6 +21,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
@@ -31,6 +33,9 @@ class TransportHub(
     private var wifiServer: ServerSocket? = null
     private var bluetoothServer: android.bluetooth.BluetoothServerSocket? = null
     private val generation = AtomicLong(0)
+    private val broadcaster = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "media-bridge-writer").apply { isDaemon = true }
+    }
     @Volatile private var config = BridgePreferences.load(context)
     @Volatile private var activeConfig: BridgeConfig? = null
     @Volatile private var latest = MediaSnapshot()
@@ -39,7 +44,11 @@ class TransportHub(
     fun start(newConfig: BridgeConfig) {
         // Repeated foreground-service requests with unchanged settings must not
         // tear down an already authenticated Windows connection.
-        if (activeConfig == newConfig) return
+        if (activeConfig == newConfig) {
+            Log.i(TAG, "start skipped: configuration unchanged")
+            return
+        }
+        Log.i(TAG, "starting transport: wifi=${newConfig.wifiEnabled}, bluetooth=${newConfig.bluetoothEnabled}, port=${newConfig.port}")
         close()
         config = newConfig
         activeConfig = newConfig
@@ -59,8 +68,12 @@ class TransportHub(
     fun broadcast(snapshot: MediaSnapshot) {
         latest = snapshot
         val line = snapshot.toJson()
-        clients.forEach { client ->
-            if (!client.send(line)) removeClient(client)
+        // Media callbacks run on Android's main thread. Socket writes must be
+        // serialized on a worker thread or StrictMode closes every client.
+        broadcaster.execute {
+            clients.forEach { client ->
+                if (!client.send(line)) removeClient(client)
+            }
         }
     }
 
@@ -128,6 +141,7 @@ class TransportHub(
         thread(name = "media-bridge-client", isDaemon = true) {
             var client: ClientConnection? = null
             try {
+                Log.i(TAG, "client accepted: $resource")
                 val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
                 val writer = BufferedWriter(OutputStreamWriter(output, Charsets.UTF_8))
                 val helloLine = reader.readLine() ?: return@thread
@@ -150,12 +164,18 @@ class TransportHub(
 
                 val clientGeneration = generation.get()
                 while (generation.get() == clientGeneration) {
-                    val line = reader.readLine() ?: break
+                    val line = reader.readLine()
+                    if (line == null) {
+                        Log.i(TAG, "client input reached EOF: $resource")
+                        break
+                    }
                     RemoteCommand.fromJson(line)?.let(commandHandler)
                 }
-            } catch (_: Exception) {
+            } catch (error: Exception) {
+                Log.w(TAG, "client reader stopped: $resource", error)
                 // A disconnected client is expected and should not become a persistent UI error.
             } finally {
+                Log.i(TAG, "client removed: $resource")
                 client?.let(::removeClient) ?: runCatching { resource.close() }
             }
         }
@@ -178,6 +198,7 @@ class TransportHub(
 
     @Synchronized
     override fun close() {
+        Log.i(TAG, "transport hub close requested")
         activeConfig = null
         generation.incrementAndGet()
         runCatching { wifiServer?.close() }
@@ -194,11 +215,15 @@ class TransportHub(
         private val resource: Closeable,
     ) : Closeable {
         @Synchronized
-        fun send(line: String): Boolean = runCatching {
+        fun send(line: String): Boolean = try {
             writer.write(line)
             writer.newLine()
             writer.flush()
-        }.isSuccess
+            true
+        } catch (error: Exception) {
+            Log.w(TAG, "client send failed", error)
+            false
+        }
 
         override fun close() {
             runCatching { resource.close() }
@@ -214,4 +239,8 @@ class TransportHub(
             .map { "${it.hostAddress}:$port" }
             .distinct()
     }.getOrDefault(emptyList())
+
+    private companion object {
+        const val TAG = "MediaBridgeTransport"
+    }
 }
