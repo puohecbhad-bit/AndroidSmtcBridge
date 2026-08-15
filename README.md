@@ -56,6 +56,9 @@ address can be supplied instead.
 Press `Ctrl+C` to stop. Windows play, pause, previous, next, stop and timeline
 seek requests are sent back to the active Android player.
 
+If you wish to keep MediaBridge working in background, please adjust your battery settings to make the service work.
+Refer to https://dontkillmyapp.com for further instructions.
+
 ## Security model
 
 The six-digit PIN prevents accidental or casual control by other devices on the
@@ -91,3 +94,4 @@ windows\build.cmd AndroidSmtcBuild\windows
 ```
 
 Build caches and generated files are intentionally excluded from source control.
+
