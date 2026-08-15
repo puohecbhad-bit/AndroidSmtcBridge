@@ -386,7 +386,7 @@ struct Options {
 
 void printUsage() {
     std::cout
-        << "Android SMTC Bridge 1.0\n\n"
+        << "Android SMTC Bridge 1.0.2\n\n"
         << "Wi-Fi:\n  smtc-bridge.exe --wifi 192.168.1.23 --pin 123456 [--port 45831]\n\n"
         << "Bluetooth (pair the phone in Windows first):\n"
         << "  smtc-bridge.exe --bluetooth auto --pin 123456\n"
@@ -438,7 +438,7 @@ BOOL WINAPI consoleHandler(DWORD signal) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
+int runSingleConnection(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCtrlHandler(consoleHandler, TRUE);
     WSADATA winsock{};
@@ -446,8 +446,10 @@ int main(int argc, char** argv) {
         std::cerr << "Winsock initialization failed\n";
         return 1;
     }
+    bool apartmentInitialized = false;
     try {
         init_apartment(apartment_type::multi_threaded);
+        apartmentInitialized = true;
         const auto options = parseOptions(argc, argv);
         SocketConnection connection;
         if (!options.wifiHost.empty()) {
@@ -484,14 +486,35 @@ int main(int argc, char** argv) {
         uninit_apartment();
     } catch (const hresult_error& error) {
         std::cerr << "Windows error: " << narrow(error.message().c_str()) << '\n';
+        if (apartmentInitialized) uninit_apartment();
         WSACleanup();
         return 1;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';
-        printUsage();
+        if (apartmentInitialized) uninit_apartment();
         WSACleanup();
         return 1;
     }
     WSACleanup();
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        (void)parseOptions(argc, argv);
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
+        printUsage();
+        return 1;
+    }
+
+    while (g_running) {
+        (void)runSingleConnection(argc, argv);
+        if (!g_running) break;
+        std::cout << "Connection lost. Reconnecting in 2 seconds...\n";
+        for (int tick = 0; tick < 20 && g_running; ++tick) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
     return 0;
 }

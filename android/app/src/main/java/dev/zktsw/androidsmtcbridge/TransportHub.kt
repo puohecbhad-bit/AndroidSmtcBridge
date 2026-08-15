@@ -32,11 +32,17 @@ class TransportHub(
     private var bluetoothServer: android.bluetooth.BluetoothServerSocket? = null
     private val generation = AtomicLong(0)
     @Volatile private var config = BridgePreferences.load(context)
+    @Volatile private var activeConfig: BridgeConfig? = null
     @Volatile private var latest = MediaSnapshot()
 
+    @Synchronized
     fun start(newConfig: BridgeConfig) {
+        // Repeated foreground-service requests with unchanged settings must not
+        // tear down an already authenticated Windows connection.
+        if (activeConfig == newConfig) return
         close()
         config = newConfig
+        activeConfig = newConfig
         val runId = generation.incrementAndGet()
         BridgeState.update {
             it.copy(
@@ -170,7 +176,9 @@ class TransportHub(
         BridgeState.update { it.copy(lastError = message) }
     }
 
+    @Synchronized
     override fun close() {
+        activeConfig = null
         generation.incrementAndGet()
         runCatching { wifiServer?.close() }
         runCatching { bluetoothServer?.close() }
