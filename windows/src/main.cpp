@@ -386,7 +386,7 @@ struct Options {
 
 void printUsage() {
     std::cout
-        << "Android SMTC Bridge 1.0.2\n\n"
+        << "Android SMTC Bridge 1.0.3\n\n"
         << "Wi-Fi:\n  smtc-bridge.exe --wifi 192.168.1.23 --pin 123456 [--port 45831]\n\n"
         << "Bluetooth (pair the phone in Windows first):\n"
         << "  smtc-bridge.exe --bluetooth auto --pin 123456\n"

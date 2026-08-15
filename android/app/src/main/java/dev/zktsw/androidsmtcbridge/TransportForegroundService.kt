@@ -10,8 +10,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 
 class TransportForegroundService : Service() {
-    private lateinit var hub: TransportHub
-
     override fun onCreate() {
         super.onCreate()
         instance = this
@@ -26,25 +24,18 @@ class TransportForegroundService : Service() {
                 .setSilent(true)
                 .build(),
         )
-        hub = TransportHub(applicationContext, MediaBridgeService::dispatchCommand)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (::hub.isInitialized) reloadTransport()
+        TransportRuntime.reload(applicationContext)
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        if (::hub.isInitialized) hub.close()
         if (instance === this) instance = null
         super.onDestroy()
-    }
-
-    private fun reloadTransport() {
-        hub.start(BridgePreferences.load(this))
-        hub.broadcast(BridgeState.state.value.media)
     }
 
     private fun createNotificationChannel() {
@@ -72,7 +63,31 @@ class TransportForegroundService : Service() {
         }
 
         fun broadcast(snapshot: MediaSnapshot) {
-            instance?.hub?.broadcast(snapshot)
+            TransportRuntime.broadcast(snapshot)
         }
+    }
+}
+
+/**
+ * Owns transport sockets for the lifetime of the app process rather than the
+ * lifetime of one Service instance. Android/OEM service recreation must not
+ * close an authenticated Windows connection.
+ */
+private object TransportRuntime {
+    @Volatile private var hub: TransportHub? = null
+
+    fun reload(context: Context) {
+        val current = hub ?: synchronized(this) {
+            hub ?: TransportHub(
+                context.applicationContext,
+                MediaBridgeService::dispatchCommand,
+            ).also { hub = it }
+        }
+        current.start(BridgePreferences.load(context))
+        current.broadcast(BridgeState.state.value.media)
+    }
+
+    fun broadcast(snapshot: MediaSnapshot) {
+        hub?.broadcast(snapshot)
     }
 }
