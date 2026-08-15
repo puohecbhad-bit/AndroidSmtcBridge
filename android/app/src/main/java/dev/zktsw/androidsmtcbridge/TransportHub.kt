@@ -20,7 +20,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
 class TransportHub(
@@ -30,14 +30,14 @@ class TransportHub(
     private val clients = CopyOnWriteArrayList<ClientConnection>()
     private var wifiServer: ServerSocket? = null
     private var bluetoothServer: android.bluetooth.BluetoothServerSocket? = null
-    private val running = AtomicBoolean(false)
+    private val generation = AtomicLong(0)
     @Volatile private var config = BridgePreferences.load(context)
     @Volatile private var latest = MediaSnapshot()
 
     fun start(newConfig: BridgeConfig) {
         close()
         config = newConfig
-        running.set(true)
+        val runId = generation.incrementAndGet()
         BridgeState.update {
             it.copy(
                 wifiRunning = false,
@@ -46,8 +46,8 @@ class TransportHub(
                 lastError = "",
             )
         }
-        if (newConfig.wifiEnabled) startWifi(newConfig.port)
-        if (newConfig.bluetoothEnabled) startBluetooth()
+        if (newConfig.wifiEnabled) startWifi(newConfig.port, runId)
+        if (newConfig.bluetoothEnabled) startBluetooth(runId)
     }
 
     fun broadcast(snapshot: MediaSnapshot) {
@@ -58,25 +58,32 @@ class TransportHub(
         }
     }
 
-    private fun startWifi(port: Int) {
+    private fun startWifi(port: Int, runId: Long) {
         thread(name = "media-bridge-wifi", isDaemon = true) {
+            var ownedServer: ServerSocket? = null
             try {
-                val server = ServerSocket(port).also { wifiServer = it }
+                if (generation.get() != runId) return@thread
+                val server = ServerSocket(port)
+                ownedServer = server
+                if (generation.get() != runId) return@thread
+                wifiServer = server
                 BridgeState.update { it.copy(wifiRunning = true) }
-                while (running.get()) {
+                while (generation.get() == runId) {
                     val socket = server.accept()
                     attach(socket.getInputStream(), socket.getOutputStream(), socket)
                 }
             } catch (error: Exception) {
-                if (running.get()) reportError("Wi-Fi: ${error.message ?: error.javaClass.simpleName}")
+                if (generation.get() == runId) reportError("Wi-Fi: ${error.message ?: error.javaClass.simpleName}")
             } finally {
-                BridgeState.update { it.copy(wifiRunning = false) }
+                runCatching { ownedServer?.close() }
+                if (wifiServer === ownedServer) wifiServer = null
+                if (generation.get() == runId) BridgeState.update { it.copy(wifiRunning = false) }
             }
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun startBluetooth() {
+    private fun startBluetooth(runId: Long) {
         if (Build.VERSION.SDK_INT >= 31 &&
             context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -84,22 +91,29 @@ class TransportHub(
             return
         }
         thread(name = "media-bridge-bluetooth", isDaemon = true) {
+            var ownedServer: android.bluetooth.BluetoothServerSocket? = null
             try {
+                if (generation.get() != runId) return@thread
                 val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
                     ?: error("设备不支持蓝牙")
                 val server = adapter.listenUsingRfcommWithServiceRecord(
                     RFCOMM_SERVICE_NAME,
                     UUID.fromString(RFCOMM_SERVICE_UUID),
-                ).also { bluetoothServer = it }
+                )
+                ownedServer = server
+                if (generation.get() != runId) return@thread
+                bluetoothServer = server
                 BridgeState.update { it.copy(bluetoothRunning = true) }
-                while (running.get()) {
+                while (generation.get() == runId) {
                     val socket = server.accept()
                     attach(socket.inputStream, socket.outputStream, socket)
                 }
             } catch (error: Exception) {
-                if (running.get()) reportError("蓝牙: ${error.message ?: error.javaClass.simpleName}")
+                if (generation.get() == runId) reportError("蓝牙: ${error.message ?: error.javaClass.simpleName}")
             } finally {
-                BridgeState.update { it.copy(bluetoothRunning = false) }
+                runCatching { ownedServer?.close() }
+                if (bluetoothServer === ownedServer) bluetoothServer = null
+                if (generation.get() == runId) BridgeState.update { it.copy(bluetoothRunning = false) }
             }
         }
     }
@@ -128,7 +142,8 @@ class TransportHub(
                 client.send(JSONObject().put("type", "hello").put("version", PROTOCOL_VERSION).put("accepted", true).toString())
                 client.send(latest.toJson())
 
-                while (running.get()) {
+                val clientGeneration = generation.get()
+                while (generation.get() == clientGeneration) {
                     val line = reader.readLine() ?: break
                     RemoteCommand.fromJson(line)?.let(commandHandler)
                 }
@@ -156,7 +171,7 @@ class TransportHub(
     }
 
     override fun close() {
-        running.set(false)
+        generation.incrementAndGet()
         runCatching { wifiServer?.close() }
         runCatching { bluetoothServer?.close() }
         wifiServer = null

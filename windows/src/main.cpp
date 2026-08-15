@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <ws2bth.h>
+#include <bluetoothapis.h>
 
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cwctype>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -26,6 +28,7 @@
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "Bthprops.lib")
 #pragma comment(lib, "windowsapp.lib")
 
 using namespace winrt;
@@ -92,21 +95,37 @@ public:
         g_activeSocket = socket_;
     }
 
-    void connectBluetooth(const std::string& mac) {
-        const BTH_ADDR address = parseBluetoothAddress(mac);
-        socket_ = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-        if (socket_ == INVALID_SOCKET) throw std::runtime_error("cannot create Bluetooth RFCOMM socket");
-        SOCKADDR_BTH target{};
-        target.addressFamily = AF_BTH;
-        target.btAddr = address;
-        target.serviceClassId = kRfcommServiceUuid;
-        target.port = BT_PORT_ANY;
-        if (::connect(socket_, reinterpret_cast<sockaddr*>(&target), sizeof(target)) == SOCKET_ERROR) {
-            const int error = WSAGetLastError();
-            close();
-            throw std::runtime_error("Bluetooth connect failed (Winsock " + std::to_string(error) + ")");
+    void connectBluetooth(const std::string& selector) {
+        std::vector<BTH_ADDR> candidates;
+        if (looksLikeBluetoothAddress(selector)) {
+            candidates.push_back(parseBluetoothAddress(selector));
+        } else {
+            candidates = findPairedBluetoothDevices(selector);
         }
-        g_activeSocket = socket_;
+        if (candidates.empty()) {
+            throw std::runtime_error("no paired Bluetooth device matched '" + selector + "'");
+        }
+        int lastError = 0;
+        for (const auto address : candidates) {
+            socket_ = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+            if (socket_ == INVALID_SOCKET) {
+                lastError = WSAGetLastError();
+                continue;
+            }
+            SOCKADDR_BTH target{};
+            target.addressFamily = AF_BTH;
+            target.btAddr = address;
+            target.serviceClassId = kRfcommServiceUuid;
+            target.port = BT_PORT_ANY;
+            if (::connect(socket_, reinterpret_cast<sockaddr*>(&target), sizeof(target)) == 0) {
+                g_activeSocket = socket_;
+                return;
+            }
+            lastError = WSAGetLastError();
+            closesocket(socket_);
+            socket_ = INVALID_SOCKET;
+        }
+        throw std::runtime_error("Bluetooth RFCOMM service was not reachable (Winsock " + std::to_string(lastError) + ")");
     }
 
     bool sendLine(const std::string& line) {
@@ -150,6 +169,14 @@ public:
     }
 
 private:
+    static bool looksLikeBluetoothAddress(std::string text) {
+        text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) {
+            return c == ':' || c == '-' || std::isspace(c);
+        }), text.end());
+        return text.size() == 12 &&
+            std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isxdigit(c); });
+    }
+
     static BTH_ADDR parseBluetoothAddress(std::string text) {
         text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) {
             return c == ':' || c == '-' || std::isspace(c);
@@ -158,6 +185,38 @@ private:
             throw std::runtime_error("Bluetooth address must look like AA:BB:CC:DD:EE:FF");
         }
         return std::stoull(text, nullptr, 16);
+    }
+
+    static std::vector<BTH_ADDR> findPairedBluetoothDevices(const std::string& selector) {
+        std::vector<BTH_ADDR> result;
+        BLUETOOTH_DEVICE_SEARCH_PARAMS search{};
+        search.dwSize = sizeof(search);
+        search.fReturnAuthenticated = TRUE;
+        search.fReturnRemembered = TRUE;
+        search.fReturnConnected = TRUE;
+        search.fReturnUnknown = FALSE;
+        search.fIssueInquiry = FALSE;
+        BLUETOOTH_DEVICE_INFO device{};
+        device.dwSize = sizeof(device);
+        HBLUETOOTH_DEVICE_FIND handle = BluetoothFindFirstDevice(&search, &device);
+        if (!handle) return result;
+        const std::wstring wanted = widen(selector);
+        do {
+            std::wstring name = device.szName;
+            auto lower = [](std::wstring value) {
+                std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) {
+                    return static_cast<wchar_t>(std::towlower(c));
+                });
+                return value;
+            };
+            if (selector == "auto" || lower(name).find(lower(wanted)) != std::wstring::npos) {
+                result.push_back(device.Address.ullLong);
+            }
+            device = {};
+            device.dwSize = sizeof(device);
+        } while (BluetoothFindNextDevice(handle, &device));
+        BluetoothFindDeviceClose(handle);
+        return result;
     }
 
     SOCKET socket_ = INVALID_SOCKET;
@@ -330,6 +389,8 @@ void printUsage() {
         << "Android SMTC Bridge 1.0\n\n"
         << "Wi-Fi:\n  smtc-bridge.exe --wifi 192.168.1.23 --pin 123456 [--port 45831]\n\n"
         << "Bluetooth (pair the phone in Windows first):\n"
+        << "  smtc-bridge.exe --bluetooth auto --pin 123456\n"
+        << "  smtc-bridge.exe --bluetooth PHONE_NAME --pin 123456\n"
         << "  smtc-bridge.exe --bluetooth AA:BB:CC:DD:EE:FF --pin 123456\n";
 }
 
@@ -350,6 +411,18 @@ Options parseOptions(int argc, char** argv) {
     }
     if ((options.wifiHost.empty() == options.bluetoothMac.empty()) || options.pin.size() != 6) {
         throw std::runtime_error("choose exactly one transport and provide a 6-digit PIN");
+    }
+    if (!options.wifiHost.empty()) {
+        const auto colon = options.wifiHost.rfind(':');
+        if (colon != std::string::npos && options.wifiHost.find(':') == colon) {
+            const auto portText = options.wifiHost.substr(colon + 1);
+            if (!portText.empty() && std::all_of(portText.begin(), portText.end(), [](unsigned char c) { return std::isdigit(c); })) {
+                const auto parsedPort = std::stoul(portText);
+                if (parsedPort == 0 || parsedPort > 65535) throw std::runtime_error("Wi-Fi port is out of range");
+                options.port = static_cast<uint16_t>(parsedPort);
+                options.wifiHost.erase(colon);
+            }
+        }
     }
     return options;
 }

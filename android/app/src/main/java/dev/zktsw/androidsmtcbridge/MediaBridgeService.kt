@@ -24,7 +24,6 @@ class MediaBridgeService : NotificationListenerService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val sequence = AtomicLong(0)
     private lateinit var sessionManager: MediaSessionManager
-    private var hub: TransportHub? = null
     private var activeController: MediaController? = null
     private var lastArtKey = ""
     private var cachedArt = EncodedArt()
@@ -50,8 +49,6 @@ class MediaBridgeService : NotificationListenerService() {
         super.onCreate()
         instance = this
         sessionManager = getSystemService(MediaSessionManager::class.java)
-        hub = TransportHub(applicationContext, ::handleCommand)
-        reloadConfig()
     }
 
     override fun onListenerConnected() {
@@ -89,13 +86,12 @@ class MediaBridgeService : NotificationListenerService() {
         }
         activeController?.unregisterCallback(controllerCallback)
         mainHandler.removeCallbacks(positionTicker)
-        hub?.close()
         if (instance === this) instance = null
         super.onDestroy()
     }
 
     fun reloadConfig() {
-        hub?.start(BridgePreferences.load(this))
+        refreshSessions()
         publish(forceArt = true)
     }
 
@@ -164,7 +160,7 @@ class MediaBridgeService : NotificationListenerService() {
             artBase64 = cachedArt.base64,
         )
         BridgeState.update { it.copy(media = snapshot) }
-        hub?.broadcast(snapshot)
+        TransportForegroundService.broadcast(snapshot)
     }
 
     private fun handleCommand(command: RemoteCommand) {
@@ -244,7 +240,12 @@ class MediaBridgeService : NotificationListenerService() {
         @Volatile private var instance: MediaBridgeService? = null
 
         fun reload(context: Context) {
+            TransportForegroundService.ensureStarted(context)
             instance?.reloadConfig() ?: requestRebind(ComponentName(context, MediaBridgeService::class.java))
+        }
+
+        fun dispatchCommand(command: RemoteCommand) {
+            instance?.handleCommand(command)
         }
     }
 }

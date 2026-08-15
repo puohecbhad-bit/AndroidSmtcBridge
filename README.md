@@ -32,6 +32,12 @@ Wi-Fi:
 smtc-bridge.exe --wifi 192.168.1.23 --pin 123456
 ```
 
+The address shown by Android can also be pasted directly:
+
+```text
+smtc-bridge.exe --wifi 192.168.1.23:45831 --pin 123456
+```
+
 Use a non-default Android port when necessary:
 
 ```text
@@ -41,8 +47,11 @@ smtc-bridge.exe --wifi 192.168.1.23 --port 45832 --pin 123456
 Bluetooth RFCOMM:
 
 ```text
-smtc-bridge.exe --bluetooth AA:BB:CC:DD:EE:FF --pin 123456
+smtc-bridge.exe --bluetooth auto --pin 123456
 ```
+
+`auto` tries paired Windows Bluetooth devices. A phone name or Bluetooth MAC
+address can be supplied instead.
 
 Press `Ctrl+C` to stop. Windows play, pause, previous, next, stop and timeline
 seek requests are sent back to the active Android player.
