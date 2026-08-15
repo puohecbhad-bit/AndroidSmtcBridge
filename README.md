@@ -78,7 +78,7 @@ The checked-in source is complete. Android uses Gradle/AGP and JDK 17 or newer.
 Windows uses the Visual C++ Build Tools and Windows 10/11 SDK:
 
 ```text
-windows\build.cmd E:\AndroidSmtcBuild\windows
+windows\build.cmd AndroidSmtcBuild\windows
 ```
 
 Build caches and generated files are intentionally excluded from source control.
