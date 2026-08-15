@@ -15,8 +15,8 @@ android {
         applicationId = "dev.zktsw.androidsmtcbridge"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.0.4"
+        versionCode = 8
+        versionName = "1.0.7"
 
         ndk {
             abiFilters += listOf("arm64-v8a")

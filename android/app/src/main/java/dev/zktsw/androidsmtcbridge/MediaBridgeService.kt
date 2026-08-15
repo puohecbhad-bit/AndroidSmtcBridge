@@ -3,9 +3,14 @@ package dev.zktsw.androidsmtcbridge
 import android.app.Notification
 import android.content.ComponentName
 import android.content.Context
+import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.media.MediaMetadata
+import android.media.AudioManager
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
@@ -16,17 +21,36 @@ import android.os.Looper
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.provider.Settings
 import android.util.Base64
 import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
 class MediaBridgeService : NotificationListenerService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val sequence = AtomicLong(0)
     private lateinit var sessionManager: MediaSessionManager
+    private lateinit var audioManager: AudioManager
     private var activeController: MediaController? = null
     private var lastArtKey = ""
+    private var loadingArtKey = ""
     private var cachedArt = EncodedArt()
+    private var notificationArtPackage = ""
+    private var notificationArtBitmap: Bitmap? = null
+    private val artExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "media-bridge-artwork").apply { isDaemon = true }
+    }
+    private var lastPublishedVolume = -1
+
+    private val volumeObserver = object : ContentObserver(mainHandler) {
+        override fun onChange(selfChange: Boolean) {
+            val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (current != lastPublishedVolume) publish()
+        }
+    }
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         selectController(controllers.orEmpty())
@@ -34,7 +58,7 @@ class MediaBridgeService : NotificationListenerService() {
 
     private val controllerCallback = object : MediaController.Callback() {
         override fun onPlaybackStateChanged(state: PlaybackState?) = publish()
-        override fun onMetadataChanged(metadata: MediaMetadata?) = publish(forceArt = true)
+        override fun onMetadataChanged(metadata: MediaMetadata?) = publish()
         override fun onSessionDestroyed() = refreshSessions()
     }
 
@@ -49,11 +73,17 @@ class MediaBridgeService : NotificationListenerService() {
         super.onCreate()
         instance = this
         sessionManager = getSystemService(MediaSessionManager::class.java)
+        audioManager = getSystemService(AudioManager::class.java)
+        contentResolver.registerContentObserver(Settings.System.CONTENT_URI, true, volumeObserver)
     }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
         BridgeState.update { it.copy(listenerConnected = true, lastError = "") }
+        activeNotifications
+            ?.filter { it.notification.category == Notification.CATEGORY_TRANSPORT }
+            ?.maxByOrNull { it.postTime }
+            ?.let(::captureNotificationArt)
         runCatching {
             sessionManager.addOnActiveSessionsChangedListener(
                 sessionListener,
@@ -77,7 +107,17 @@ class MediaBridgeService : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn?.notification?.category == Notification.CATEGORY_TRANSPORT) refreshSessions()
+        if (sbn?.notification?.category == Notification.CATEGORY_TRANSPORT) {
+            captureNotificationArt(sbn)
+            refreshSessions()
+        }
+    }
+
+    private fun captureNotificationArt(sbn: StatusBarNotification) {
+        notificationArtPackage = sbn.packageName
+        notificationArtBitmap = sbn.notification.getLargeIcon()
+            ?.loadDrawable(this)
+            ?.let(::drawableToBitmap)
     }
 
     override fun onDestroy() {
@@ -86,6 +126,8 @@ class MediaBridgeService : NotificationListenerService() {
         }
         activeController?.unregisterCallback(controllerCallback)
         mainHandler.removeCallbacks(positionTicker)
+        contentResolver.unregisterContentObserver(volumeObserver)
+        artExecutor.shutdownNow()
         if (instance === this) instance = null
         super.onDestroy()
     }
@@ -123,20 +165,35 @@ class MediaBridgeService : NotificationListenerService() {
         val controller = activeController
         val metadata = controller?.metadata
         val playbackState = controller?.playbackState
+        val packageName = controller?.packageName.orEmpty()
         val position = currentPosition(playbackState, metadata)
         val actions = playbackState?.actions ?: 0L
+        val config = BridgePreferences.load(this)
+        val volumeLevel = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val volumeMax = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        lastPublishedVolume = volumeLevel
         val artKey = listOf(
-            controller?.packageName.orEmpty(),
-            metadata?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID).orEmpty(),
-            metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty(),
+            packageName,
+            artworkTrackIdentity(metadata),
             metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI).orEmpty(),
+            metadata?.getString(MediaMetadata.METADATA_KEY_ART_URI).orEmpty(),
         ).joinToString("|")
-        if (forceArt || artKey != lastArtKey) {
-            cachedArt = encodeArt(metadata)
+        if ((forceArt || artKey != lastArtKey) && loadingArtKey != artKey) {
             lastArtKey = artKey
+            loadingArtKey = artKey
+            val fallbackArt = notificationArtBitmap.takeIf { notificationArtPackage == packageName }
+            artExecutor.execute {
+                val encoded = encodeArt(metadata, fallbackArt)
+                mainHandler.post {
+                    if (lastArtKey == artKey) {
+                        cachedArt = encoded
+                        loadingArtKey = ""
+                        publish()
+                    }
+                }
+            }
         }
 
-        val packageName = controller?.packageName.orEmpty()
         val snapshot = MediaSnapshot(
             sequence = sequence.incrementAndGet(),
             packageName = packageName,
@@ -156,6 +213,8 @@ class MediaBridgeService : NotificationListenerService() {
             canNext = actions and PlaybackState.ACTION_SKIP_TO_NEXT != 0L,
             canPrevious = actions and PlaybackState.ACTION_SKIP_TO_PREVIOUS != 0L,
             canSeek = actions and PlaybackState.ACTION_SEEK_TO != 0L,
+            volume = if (config.volumeSyncEnabled) volumeLevel.toDouble() / volumeMax else -1.0,
+            volumeSyncEnabled = config.volumeSyncEnabled,
             artMime = cachedArt.mime,
             artBase64 = cachedArt.base64,
         )
@@ -163,17 +222,40 @@ class MediaBridgeService : NotificationListenerService() {
         TransportForegroundService.broadcast(snapshot)
     }
 
+    private fun artworkTrackIdentity(metadata: MediaMetadata?): String {
+        val title = metadata.text(MediaMetadata.METADATA_KEY_TITLE, MediaMetadata.METADATA_KEY_DISPLAY_TITLE).trim()
+        val artist = metadata.text(MediaMetadata.METADATA_KEY_ARTIST, MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE).trim()
+        val embeddedTrack = TRACK_AND_ARTIST.find(artist)
+        return if (embeddedTrack != null) {
+            val (trackName, trackArtist) = embeddedTrack.destructured
+            "${trackName.trim()}\u001f${trackArtist.trim()}"
+        } else {
+            "$title\u001f$artist"
+        }
+    }
+
     private fun handleCommand(command: RemoteCommand) {
         mainHandler.post {
-            val controls = activeController?.transportControls ?: return@post
+            val controls = activeController?.transportControls
             when (command.action) {
-                "play" -> controls.play()
-                "pause" -> controls.pause()
-                "toggle" -> if (activeController?.playbackState?.state == PlaybackState.STATE_PLAYING) controls.pause() else controls.play()
-                "next" -> controls.skipToNext()
-                "previous" -> controls.skipToPrevious()
-                "stop" -> controls.stop()
-                "seek" -> command.positionMs?.coerceAtLeast(0)?.let(controls::seekTo)
+                "play" -> controls?.play()
+                "pause" -> controls?.pause()
+                "toggle" -> if (activeController?.playbackState?.state == PlaybackState.STATE_PLAYING) controls?.pause() else controls?.play()
+                "next" -> controls?.skipToNext()
+                "previous" -> controls?.skipToPrevious()
+                "stop" -> controls?.stop()
+                "seek" -> command.positionMs?.coerceAtLeast(0)?.let { controls?.seekTo(it) }
+                "volume" -> if (BridgePreferences.load(this).volumeSyncEnabled) {
+                    command.volume?.let { scalar ->
+                        val maximum = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                        audioManager.setStreamVolume(
+                            AudioManager.STREAM_MUSIC,
+                            (scalar * maximum).toInt().coerceIn(0, maximum),
+                            0,
+                        )
+                        publish()
+                    }
+                }
             }
         }
     }
@@ -189,21 +271,24 @@ class MediaBridgeService : NotificationListenerService() {
     }
 
     @Suppress("DEPRECATION")
-    private fun encodeArt(metadata: MediaMetadata?): EncodedArt {
+    private fun encodeArt(metadata: MediaMetadata?, fallback: Bitmap?): EncodedArt {
         val bitmap = metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
             ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
             ?: metadata?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
             ?: loadUriBitmap(metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI))
             ?: loadUriBitmap(metadata?.getString(MediaMetadata.METADATA_KEY_ART_URI))
+            ?: loadUriBitmap(metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI))
+            ?: fallback
             ?: return EncodedArt()
         return runCatching {
             val scaled = scaleDown(bitmap, 512)
             val output = ByteArrayOutputStream()
-            val format = if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.JPEG
-            scaled.compress(format, 82, output)
+            // JPEG is consistently decoded by Windows SMTC. WebP thumbnails
+            // are accepted by some Windows builds but silently ignored by others.
+            scaled.compress(Bitmap.CompressFormat.JPEG, 88, output)
             if (scaled !== bitmap) scaled.recycle()
             EncodedArt(
-                mime = if (Build.VERSION.SDK_INT >= 30) "image/webp" else "image/jpeg",
+                mime = "image/jpeg",
                 base64 = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP),
             )
         }.getOrDefault(EncodedArt())
@@ -212,7 +297,20 @@ class MediaBridgeService : NotificationListenerService() {
     private fun loadUriBitmap(value: String?): Bitmap? {
         if (value.isNullOrBlank()) return null
         return runCatching {
-            contentResolver.openInputStream(Uri.parse(value))?.use(BitmapFactory::decodeStream)
+            val uri = Uri.parse(value)
+            if (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) {
+                val connection = URL(value).openConnection() as HttpURLConnection
+                connection.connectTimeout = 5_000
+                connection.readTimeout = 8_000
+                connection.instanceFollowRedirects = true
+                try {
+                    connection.inputStream.use(BitmapFactory::decodeStream)
+                } finally {
+                    connection.disconnect()
+                }
+            } else {
+                contentResolver.openInputStream(uri)?.use(BitmapFactory::decodeStream)
+            }
         }.getOrNull()
     }
 
@@ -220,6 +318,17 @@ class MediaBridgeService : NotificationListenerService() {
         if (bitmap.width <= max && bitmap.height <= max) return bitmap
         val ratio = minOf(max.toFloat() / bitmap.width, max.toFloat() / bitmap.height)
         return Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt(), (bitmap.height * ratio).toInt(), true)
+    }
+
+    private fun drawableToBitmap(drawable: Drawable): Bitmap {
+        if (drawable is BitmapDrawable) return drawable.bitmap
+        val width = drawable.intrinsicWidth.coerceAtLeast(1).coerceAtMost(1024)
+        val height = drawable.intrinsicHeight.coerceAtLeast(1).coerceAtMost(1024)
+        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
+            val canvas = Canvas(bitmap)
+            drawable.setBounds(0, 0, canvas.width, canvas.height)
+            drawable.draw(canvas)
+        }
     }
 
     private fun appLabel(packageName: String): String {
@@ -237,6 +346,7 @@ class MediaBridgeService : NotificationListenerService() {
     private data class EncodedArt(val mime: String = "", val base64: String = "")
 
     companion object {
+        private val TRACK_AND_ARTIST = Regex("^(.+?)\\s+[\\-–—]\\s+(.+)$")
         @Volatile private var instance: MediaBridgeService? = null
 
         fun reload(context: Context) {

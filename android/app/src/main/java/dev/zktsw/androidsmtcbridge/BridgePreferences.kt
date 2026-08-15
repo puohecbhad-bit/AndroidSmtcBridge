@@ -6,6 +6,7 @@ import java.security.SecureRandom
 data class BridgeConfig(
     val wifiEnabled: Boolean,
     val bluetoothEnabled: Boolean,
+    val volumeSyncEnabled: Boolean,
     val port: Int,
     val pin: String,
 )
@@ -14,6 +15,7 @@ object BridgePreferences {
     private const val FILE = "bridge_preferences"
     private const val WIFI = "wifi_enabled"
     private const val BLUETOOTH = "bluetooth_enabled"
+    private const val VOLUME_SYNC = "volume_sync_enabled"
     private const val PORT = "port"
     private const val PIN = "pin"
 
@@ -27,6 +29,7 @@ object BridgePreferences {
         return BridgeConfig(
             wifiEnabled = prefs.getBoolean(WIFI, true),
             bluetoothEnabled = prefs.getBoolean(BLUETOOTH, false),
+            volumeSyncEnabled = prefs.getBoolean(VOLUME_SYNC, true),
             port = prefs.getInt(PORT, 45831).coerceIn(1024, 65535),
             pin = pin,
         )
@@ -36,6 +39,7 @@ object BridgePreferences {
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
             .putBoolean(WIFI, config.wifiEnabled)
             .putBoolean(BLUETOOTH, config.bluetoothEnabled)
+            .putBoolean(VOLUME_SYNC, config.volumeSyncEnabled)
             .putInt(PORT, config.port.coerceIn(1024, 65535))
             .putString(PIN, config.pin.filter(Char::isDigit).take(6).padStart(6, '0'))
             .apply()

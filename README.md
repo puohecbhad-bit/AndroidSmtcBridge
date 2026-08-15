@@ -3,6 +3,8 @@
 This project mirrors the active Android media session into Windows System Media
 Transport Controls (SMTC). It synchronizes metadata, album art, playback state,
 timeline and supported controls. It does **not** forward audio.
+Optional bidirectional volume sync mirrors Android's media-stream volume and
+the Windows default output master volume in either direction.
 
 ## Components
 
@@ -19,7 +21,9 @@ timeline and supported controls. It does **not** forward audio.
    enabled notification-listener component to enumerate other apps' active
    media sessions.
 3. Enable Wi-Fi, Bluetooth, or both.
-4. Note the displayed IP address and six-digit PIN.
+4. Leave **Bidirectional volume** enabled if both devices should track volume
+   changes made on either side.
+5. Note the displayed IP address and six-digit PIN.
 
 For Bluetooth, pair the phone in Windows Bluetooth settings first, then tap
 **Make this phone discoverable** in the Android app before connecting.
@@ -71,7 +75,7 @@ Both transports carry UTF-8 JSON objects separated by `LF`. The client first
 sends:
 
 ```json
-{"type":"hello","version":1,"pin":"123456"}
+{"type":"hello","version":2,"pin":"123456"}
 ```
 
 The server replies with an acknowledgement and then sends `state` objects.
@@ -82,7 +86,9 @@ Commands use the following shape:
 ```
 
 Valid actions are `play`, `pause`, `toggle`, `previous`, `next`, `stop`, and
-`seek`. Frames are limited to 8 MiB by the Windows client.
+`seek`. Protocol v2 additionally carries `volume` and `volumeSyncEnabled` in
+state frames and accepts `{"action":"volume","volume":0.5}` commands. Frames
+are limited to 8 MiB by the Windows client.
 
 ## Rebuilding
 

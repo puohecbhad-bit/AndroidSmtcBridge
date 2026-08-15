@@ -4,6 +4,8 @@
 #include <ws2tcpip.h>
 #include <ws2bth.h>
 #include <bluetoothapis.h>
+#include <endpointvolume.h>
+#include <mmdeviceapi.h>
 
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
@@ -16,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <cwctype>
@@ -30,6 +33,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "Bthprops.lib")
 #pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "Ole32.lib")
 
 using namespace winrt;
 using namespace Windows::Data::Json;
@@ -41,7 +45,7 @@ using namespace Windows::Security::Cryptography;
 using namespace Windows::Storage::Streams;
 
 namespace {
-constexpr int kProtocolVersion = 1;
+constexpr int kProtocolVersion = 2;
 constexpr uint16_t kDefaultPort = 45831;
 constexpr GUID kRfcommServiceUuid = {
     0x8e7f1a9d, 0x2c64, 0x4db8, {0x9f, 0x75, 0x6a, 0x33, 0xce, 0x5b, 0x21, 0x70}
@@ -238,6 +242,8 @@ struct RemoteState {
     bool canNext = false;
     bool canPrevious = false;
     bool canSeek = false;
+    double volume = -1.0;
+    bool volumeSyncEnabled = false;
 };
 
 TimeSpan milliseconds(int64_t value) {
@@ -265,10 +271,95 @@ std::vector<uint8_t> silentWav() {
     return bytes;
 }
 
+class VolumeBridge {
+public:
+    explicit VolumeBridge(SocketConnection& connection) : connection_(connection), worker_([this] { run(); }) {}
+    VolumeBridge(const VolumeBridge&) = delete;
+    VolumeBridge& operator=(const VolumeBridge&) = delete;
+    ~VolumeBridge() { stop(); }
+
+    void updateFromAndroid(bool enabled, double volume) {
+        const bool wasEnabled = enabled_.exchange(enabled);
+        if (!enabled || volume < 0.0) return;
+        const float next = static_cast<float>(std::clamp(volume, 0.0, 1.0));
+        const float previous = lastRemoteVolume_.exchange(next);
+        if (!wasEnabled || std::abs(previous - next) > 0.004f) {
+            requestedVolume_.store(next);
+            requestRevision_.fetch_add(1);
+        }
+    }
+
+    void stop() {
+        if (!running_.exchange(false)) return;
+        if (worker_.joinable()) worker_.join();
+    }
+
+private:
+    void sendVolume(float volume) {
+        JsonObject object;
+        object.SetNamedValue(L"type", JsonValue::CreateStringValue(L"command"));
+        object.SetNamedValue(L"action", JsonValue::CreateStringValue(L"volume"));
+        object.SetNamedValue(L"volume", JsonValue::CreateNumberValue(volume));
+        connection_.sendLine(narrow(object.Stringify().c_str()));
+    }
+
+    void run() {
+        const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        IMMDeviceEnumerator* enumerator = nullptr;
+        IMMDevice* device = nullptr;
+        IAudioEndpointVolume* endpoint = nullptr;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator))) &&
+            SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) &&
+            SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(&endpoint)))) {
+            uint64_t handledRevision = 0;
+            float lastObserved = -1.0f;
+            auto suppressUntil = std::chrono::steady_clock::time_point{};
+            while (running_) {
+                if (!enabled_) {
+                    lastObserved = -1.0f;
+                } else {
+                    const uint64_t revision = requestRevision_.load();
+                    if (revision != handledRevision) {
+                        const float requested = requestedVolume_.load();
+                        endpoint->SetMasterVolumeLevelScalar(requested, nullptr);
+                        lastObserved = requested;
+                        handledRevision = revision;
+                        suppressUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+                    }
+                    float current = 0.0f;
+                    if (SUCCEEDED(endpoint->GetMasterVolumeLevelScalar(&current))) {
+                        if (lastObserved < 0.0f) {
+                            lastObserved = current;
+                        } else if (std::abs(current - lastObserved) > 0.004f) {
+                            if (std::chrono::steady_clock::now() >= suppressUntil) sendVolume(current);
+                            lastObserved = current;
+                        }
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        if (endpoint) endpoint->Release();
+        if (device) device->Release();
+        if (enumerator) enumerator->Release();
+        if (SUCCEEDED(apartment)) CoUninitialize();
+    }
+
+    SocketConnection& connection_;
+    std::atomic_bool running_{true};
+    std::atomic_bool enabled_{false};
+    std::atomic<float> requestedVolume_{0.0f};
+    std::atomic<float> lastRemoteVolume_{-2.0f};
+    std::atomic<uint64_t> requestRevision_{0};
+    std::thread worker_;
+};
+
 class SmtcPublisher {
 public:
     explicit SmtcPublisher(SocketConnection& connection)
-        : connection_(connection), player_(), controls_(player_.SystemMediaTransportControls()) {
+        : connection_(connection), player_(), controls_(player_.SystemMediaTransportControls()), volumeBridge_(connection) {
         player_.CommandManager().IsEnabled(false);
         player_.IsLoopingEnabled(true);
         player_.Volume(0.0);
@@ -291,6 +382,7 @@ public:
     }
 
     void update(const RemoteState& state) {
+        volumeBridge_.updateFromAndroid(state.volumeSyncEnabled, state.volume);
         controls_.IsEnabled(!state.title.empty());
         controls_.IsPlayEnabled(state.canPlay);
         controls_.IsPauseEnabled(state.canPause);
@@ -304,18 +396,23 @@ public:
         music.Title(state.title);
         music.Artist(state.artist);
         music.AlbumTitle(state.album);
-        if (!state.artBase64.empty()) {
-            try {
-                auto buffer = CryptographicBuffer::DecodeFromBase64String(state.artBase64);
-                InMemoryRandomAccessStream stream;
-                stream.WriteAsync(buffer).get();
-                stream.Seek(0);
-                updater.Thumbnail(RandomAccessStreamReference::CreateFromStream(stream));
-            } catch (...) {
+        if (state.artBase64 != lastArtBase64_) {
+            lastArtBase64_ = state.artBase64;
+            if (!state.artBase64.empty()) {
+                try {
+                    auto buffer = CryptographicBuffer::DecodeFromBase64String(state.artBase64);
+                    artworkStream_ = InMemoryRandomAccessStream();
+                    artworkStream_.WriteAsync(buffer).get();
+                    artworkStream_.Seek(0);
+                    updater.Thumbnail(RandomAccessStreamReference::CreateFromStream(artworkStream_));
+                } catch (...) {
+                    artworkStream_ = nullptr;
+                    updater.Thumbnail(nullptr);
+                }
+            } else {
+                artworkStream_ = nullptr;
                 updater.Thumbnail(nullptr);
             }
-        } else {
-            updater.Thumbnail(nullptr);
         }
         updater.Update();
 
@@ -331,6 +428,8 @@ public:
         else if (state.playback == L"paused") controls_.PlaybackStatus(MediaPlaybackStatus::Paused);
         else controls_.PlaybackStatus(MediaPlaybackStatus::Stopped);
     }
+
+    void stop() { volumeBridge_.stop(); }
 
 private:
     void prepareSilentSource() {
@@ -356,7 +455,10 @@ private:
     SocketConnection& connection_;
     MediaPlayer player_;
     SystemMediaTransportControls controls_;
+    VolumeBridge volumeBridge_;
     InMemoryRandomAccessStream silentStream_{nullptr};
+    InMemoryRandomAccessStream artworkStream_{nullptr};
+    std::wstring lastArtBase64_;
 };
 
 RemoteState parseState(const JsonObject& json) {
@@ -374,6 +476,8 @@ RemoteState parseState(const JsonObject& json) {
     state.canNext = json.GetNamedBoolean(L"canNext", false);
     state.canPrevious = json.GetNamedBoolean(L"canPrevious", false);
     state.canSeek = json.GetNamedBoolean(L"canSeek", false);
+    state.volume = json.GetNamedNumber(L"volume", -1.0);
+    state.volumeSyncEnabled = json.GetNamedBoolean(L"volumeSyncEnabled", false);
     return state;
 }
 
@@ -386,7 +490,7 @@ struct Options {
 
 void printUsage() {
     std::cout
-        << "Android SMTC Bridge 1.0.4\n\n"
+        << "Android SMTC Bridge 1.0.7\n\n"
         << "Wi-Fi:\n  smtc-bridge.exe --wifi 192.168.1.23 --pin 123456 [--port 45831]\n\n"
         << "Bluetooth (pair the phone in Windows first):\n"
         << "  smtc-bridge.exe --bluetooth auto --pin 123456\n"
@@ -482,6 +586,7 @@ int runSingleConnection(int argc, char** argv) {
             }
         }
         std::cout << "\nDisconnected.\n";
+        publisher.stop();
         connection.close();
         uninit_apartment();
     } catch (const hresult_error& error) {

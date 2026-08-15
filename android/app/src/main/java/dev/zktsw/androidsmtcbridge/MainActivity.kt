@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.net.Uri
 import android.provider.Settings
 import android.util.Base64
 import androidx.activity.ComponentActivity
@@ -120,6 +122,10 @@ private fun BridgeScreen() {
     var config by remember { mutableStateOf(BridgePreferences.load(context)) }
     var portText by remember(config.port) { mutableStateOf(config.port.toString()) }
     var pinText by remember(config.pin) { mutableStateOf(config.pin) }
+    val powerManager = remember { context.getSystemService(PowerManager::class.java) }
+    var backgroundAllowed by remember {
+        mutableStateOf(Build.VERSION.SDK_INT < 23 || powerManager.isIgnoringBatteryOptimizations(context.packageName))
+    }
 
     val bluetoothPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -132,6 +138,12 @@ private fun BridgeScreen() {
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { }
+    val batteryOptimization = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        backgroundAllowed = Build.VERSION.SDK_INT < 23 ||
+            powerManager.isIgnoringBatteryOptimizations(context.packageName)
+    }
 
     LaunchedEffect(Unit) {
         MediaBridgeService.reload(context)
@@ -259,6 +271,32 @@ private fun BridgeScreen() {
                     Spacer(Modifier.size(8.dp))
                     Text("打开通知使用权设置")
                 }
+            }
+            ExpressiveCard(title = "后台运行", icon = Icons.Rounded.CheckCircle) {
+                Text(if (backgroundAllowed) "已允许熄屏持续同步" else "请允许忽略电池优化，避免锁屏后暂停同步。")
+                if (!backgroundAllowed) {
+                    Button(onClick = {
+                        batteryOptimization.launch(
+                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                data = Uri.parse("package:${context.packageName}")
+                            },
+                        )
+                    }) {
+                        Text("允许后台运行")
+                    }
+                }
+            }
+            ExpressiveCard(title = "同步选项", icon = Icons.Rounded.MusicNote) {
+                FilterChip(
+                    selected = config.volumeSyncEnabled,
+                    onClick = { persist(config.copy(volumeSyncEnabled = !config.volumeSyncEnabled)) },
+                    label = { Text("双向音量") },
+                    leadingIcon = { Icon(Icons.Rounded.MusicNote, null, Modifier.size(18.dp)) },
+                )
+                Text(
+                    "开启后，在手机或 Windows 任意一端调节媒体音量，另一端都会跟随。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
             Spacer(Modifier.height(12.dp))
         }

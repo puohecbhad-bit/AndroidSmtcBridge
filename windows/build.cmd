@@ -11,6 +11,8 @@ if /I not "%OUT:~0,2%"=="E:" if /I not "%OUT:~0,2%"=="F:" (
 )
 if not exist "%OUT%" mkdir "%OUT%"
 for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
+if not defined VSROOT for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VSROOT=%%i"
+if not defined VSROOT if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" set "VSROOT=%ProgramFiles(x86)%\Microsoft Visual Studio\18\BuildTools"
 if not defined VSROOT (
   echo Visual C++ Build Tools were not found.
   exit /b 1
