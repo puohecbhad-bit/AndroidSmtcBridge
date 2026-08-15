@@ -37,6 +37,7 @@ class MediaBridgeService : NotificationListenerService() {
     private var activeController: MediaController? = null
     private var lastArtKey = ""
     private var loadingArtKey = ""
+    private var artLoadGeneration = 0L
     private var cachedArt = EncodedArt()
     private var notificationArtPackage = ""
     private var notificationArtBitmap: Bitmap? = null
@@ -51,6 +52,8 @@ class MediaBridgeService : NotificationListenerService() {
             if (current != lastPublishedVolume) publish()
         }
     }
+
+    private val notificationArtworkRefresh = Runnable { publish(forceArt = true) }
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         selectController(controllers.orEmpty())
@@ -110,6 +113,10 @@ class MediaBridgeService : NotificationListenerService() {
         if (sbn?.notification?.category == Notification.CATEGORY_TRANSPORT) {
             captureNotificationArt(sbn)
             refreshSessions()
+            if (sbn.packageName == activeController?.packageName) {
+                mainHandler.removeCallbacks(notificationArtworkRefresh)
+                mainHandler.postDelayed(notificationArtworkRefresh, NOTIFICATION_ARTWORK_DELAY_MS)
+            }
         }
     }
 
@@ -126,6 +133,7 @@ class MediaBridgeService : NotificationListenerService() {
         }
         activeController?.unregisterCallback(controllerCallback)
         mainHandler.removeCallbacks(positionTicker)
+        mainHandler.removeCallbacks(notificationArtworkRefresh)
         contentResolver.unregisterContentObserver(volumeObserver)
         artExecutor.shutdownNow()
         if (instance === this) instance = null
@@ -178,16 +186,19 @@ class MediaBridgeService : NotificationListenerService() {
             metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI).orEmpty(),
             metadata?.getString(MediaMetadata.METADATA_KEY_ART_URI).orEmpty(),
         ).joinToString("|")
-        if ((forceArt || artKey != lastArtKey) && loadingArtKey != artKey) {
+        if (forceArt || (artKey != lastArtKey && loadingArtKey != artKey)) {
             lastArtKey = artKey
             loadingArtKey = artKey
+            val loadGeneration = ++artLoadGeneration
             val fallbackArt = notificationArtBitmap.takeIf { notificationArtPackage == packageName }
             artExecutor.execute {
                 val encoded = encodeArt(metadata, fallbackArt)
                 mainHandler.post {
-                    if (lastArtKey == artKey) {
-                        cachedArt = encoded
+                    if (lastArtKey == artKey && artLoadGeneration == loadGeneration) {
                         loadingArtKey = ""
+                        if (encoded.base64.isNotEmpty()) {
+                            cachedArt = encoded
+                        }
                         publish()
                     }
                 }
@@ -346,6 +357,7 @@ class MediaBridgeService : NotificationListenerService() {
     private data class EncodedArt(val mime: String = "", val base64: String = "")
 
     companion object {
+        private const val NOTIFICATION_ARTWORK_DELAY_MS = 200L
         private val TRACK_AND_ARTIST = Regex("^(.+?)\\s+[\\-–—]\\s+(.+)$")
         @Volatile private var instance: MediaBridgeService? = null
 
